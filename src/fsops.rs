@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ApfsClone,
     Reflink,
     Copy,
@@ -109,10 +110,12 @@ fn is_unsupported(err: &io::Error) -> bool {
     matches!(
         err.kind(),
         io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices | io::ErrorKind::InvalidInput
-    ) || matches!(
-        err.raw_os_error(),
-        Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-    )
+    ) || err
+        .raw_os_error()
+        // ENOTSUP and EOPNOTSUPP are the same value on Linux, distinct on macOS.
+        .is_some_and(|code| {
+            [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EXDEV, libc::EINVAL].contains(&code)
+        })
 }
 
 impl Copier {
@@ -347,6 +350,7 @@ impl Copier {
 
     /// After a whole-tree clone, remove the few multi-component excludes
     /// (`.turbo/daemon`) that the atomic clone could not skip. Bounded depth.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn post_prune(&self, rel: &str, dst: &Path) {
         let mut walker = walkdir::WalkDir::new(dst)
             .follow_links(false)
@@ -369,6 +373,7 @@ impl Copier {
     }
 
     /// readdir-only sweep: count files, rewrite absolute symlinks into the source.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn sweep_symlinks(&self, dst: &Path) -> u64 {
         let mut files = 0u64;
         for entry in walkdir::WalkDir::new(dst)
