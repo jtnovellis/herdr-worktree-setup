@@ -1,0 +1,46 @@
+# herdr-plugin.toml — manifest for the worktree-setup plugin.
+#
+# On `worktree.created` the hook opens a "Worktree Setup" split in the new
+# workspace and runs an auto-detected pipeline: copy gitignored dev state
+# (.env*, .envrc, IDE/deploy config) from the source checkout, clone dependency
+# caches (APFS clonefile / reflink — zero extra disk), `mise trust`,
+# `direnv allow`, install dependencies, then any repo-defined [[steps]].
+#
+# Every command goes through scripts/run.sh, which execs the built binary or —
+# when the tree was `plugin link`ed without a build — fails loudly with a
+# notification instead of silently doing nothing.
+
+id = "worktree-setup"
+name = "Worktree Setup"
+version = "0.1.0"
+# worktree.created is emitted for UI- and API-created worktrees from herdr 0.8.
+min_herdr_version = "0.8.0"
+description = "Make a new git worktree immediately usable: copy .env & dev state, clone dependency caches (APFS/reflink), mise trust, direnv allow, install deps — with a live TUI."
+platforms = ["macos", "linux"]
+
+# Runs on `herdr plugin install`: downloads the prebuilt release binary for this
+# platform (SHA-256 verified) and falls back to `cargo build --release`.
+[[build]]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+
+[[events]]
+on = "worktree.created"
+command = ["sh", "-c", "exec sh \"$HERDR_PLUGIN_ROOT/scripts/run.sh\" hook"]
+
+[[panes]]
+id = "setup"
+title = "Worktree Setup"
+placement = "split"
+command = ["sh", "-c", "exec sh \"$HERDR_PLUGIN_ROOT/scripts/run.sh\" ui"]
+
+[[actions]]
+id = "run"
+title = "Worktree Setup: run for this workspace"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec sh \"$HERDR_PLUGIN_ROOT/scripts/run.sh\" run"]
+
+[[actions]]
+id = "plan"
+title = "Worktree Setup: show plan (dry run)"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec sh \"$HERDR_PLUGIN_ROOT/scripts/run.sh\" run --dry-run"]

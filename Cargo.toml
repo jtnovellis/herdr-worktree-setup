@@ -1,0 +1,37 @@
+[package]
+name = "herdr-worktree-setup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "herdr plugin: make a new git worktree immediately usable (copy .env & dev state, clone dependency caches, mise trust, direnv allow, install deps) with a live TUI"
+license = "MIT"
+repository = "https://github.com/jtnovellis/herdr-worktree-setup"
+publish = false
+
+[[bin]]
+name = "herdr-worktree-setup"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+ansi-to-tui = "8"
+strip-ansi-escapes = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+anyhow = "1"
+globset = "0.4"
+walkdir = "2"
+which = "8"
+reflink-copy = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

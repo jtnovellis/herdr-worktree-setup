@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  BIN: herdr-worktree-setup
+
+jobs:
+  verify:
+    name: tag matches manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tag=${GITHUB_REF_NAME#v}
+          cargo_v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          plugin_v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -n1)
+          echo "tag=$tag cargo=$cargo_v plugin=$plugin_v"
+          test "$tag" = "$cargo_v" && test "$tag" = "$plugin_v"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,       os: macos-latest }
+          - { target: x86_64-apple-darwin,        os: macos-latest }
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        run: |
+          asset="$BIN-${{ matrix.target }}.tar.gz"
+          tar -czf "$asset" -C "target/${{ matrix.target }}/release" "$BIN"
+          sha256sum "$asset" > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.BIN }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN }}-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          cd dist && cat *.sha256 | sort -k2 > SHA256SUMS && rm *.sha256 && cat SHA256SUMS
+      - name: create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

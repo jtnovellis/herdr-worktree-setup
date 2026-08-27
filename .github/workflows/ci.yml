@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: git identity for fixture repos
+        run: |
+          git config --global user.email ci@example.invalid
+          git config --global user.name ci
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release --locked
+
+  scripts:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n scripts/fetch-or-build.sh && sh -n scripts/run.sh
+      - name: fetch-or-build falls back to cargo on a failed download
+        run: |
+          stub=$(mktemp -d); mkdir -p "$stub/bin"
+          printf '#!/bin/sh\nexit 22\n' > "$stub/bin/curl"
+          printf '#!/bin/sh\necho "stub cargo $*"\n' > "$stub/bin/cargo"
+          chmod +x "$stub/bin/"*
+          HOME=/nonexistent PATH="$stub/bin:/usr/bin:/bin" sh scripts/fetch-or-build.sh 2>&1 | tee out.txt
+          grep -q 'building from source instead' out.txt
+          grep -q 'stub cargo build --release --locked' out.txt
+      - name: run.sh fails loudly when the binary is missing
+        run: |
+          set +e
+          out=$(HERDR_BIN_PATH=/bin/true sh scripts/run.sh hook 2>&1); code=$?
+          set -e
+          test "$code" -eq 1
+          echo "$out" | grep -q 'binary not found'
