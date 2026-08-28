@@ -99,7 +99,13 @@ fixed and has a regression test.
 - `step_timeout_secs` configuration key.
 - `SECURITY.md` with the full trust model and a reporting channel.
 
-## 0.1.0 — 2026-08-27 (withdrawn — see 0.1.1)
+## 0.1.0 — 2026-08-27 (WITHDRAWN)
+
+Contains a command injection reachable with no user interaction, and writes
+outside the worktree via a committed symlink. The release binaries were deleted
+on 2026-08-28; the tag and the removed assets' digests are kept on the [release
+page](https://github.com/jtnovellis/herdr-worktree-setup/releases/tag/v0.1.0)
+so the withdrawal is auditable. Do not use. Original notes follow.
 
 Initial release.
 
