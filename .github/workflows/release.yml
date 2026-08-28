@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Lets the release pipeline be exercised without cutting a release — useful
+  # after bumping the actions it depends on, which CI does not otherwise cover.
+  workflow_dispatch:
 
 # No blanket write token: only `publish` may touch the release, and only
 # `build` may sign for provenance.
@@ -18,11 +21,12 @@ env:
 jobs:
   verify:
     name: tag matches manifests
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - run: |
@@ -35,6 +39,9 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     needs: verify
+    # `verify` is skipped on a manual run; a skipped dependency must not skip
+    # the build, but a failed one must.
+    if: always() && needs.verify.result != 'failure' && needs.verify.result != 'cancelled'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -50,7 +57,7 @@ jobs:
           - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -67,10 +74,10 @@ jobs:
           tar -czf "$asset" -C "target/${{ matrix.target }}/release" "$BIN"
           sha256sum "$asset" > "$asset.sha256"
       - name: attest provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: ${{ env.BIN }}-${{ matrix.target }}.tar.gz
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -80,14 +87,16 @@ jobs:
   publish:
     name: publish release
     needs: build
+    # Only a tag publishes. A manual run stops after build + attest.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
