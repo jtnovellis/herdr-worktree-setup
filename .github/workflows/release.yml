@@ -84,9 +84,36 @@ jobs:
             ${{ env.BIN }}-${{ matrix.target }}.tar.gz
             ${{ env.BIN }}-${{ matrix.target }}.tar.gz.sha256
 
+  # Runs on every invocation, including a manual dry run: round-trips the
+  # artifacts and re-checks their digests, so the download path and the
+  # checksum file are exercised without needing a release to exist.
+  check-artifacts:
+    name: verify artifacts
+    needs: build
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: every target is present and matches its checksum
+        run: |
+          cd dist
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          for t in aarch64-apple-darwin x86_64-apple-darwin \
+                   x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -f "$BIN-$t.tar.gz" || { echo "missing $t"; exit 1; }
+          done
+          sha256sum --check SHA256SUMS
+          tar -tzf "$BIN-x86_64-unknown-linux-musl.tar.gz" | grep -qx "$BIN"
+          echo "all four targets present, checksums verified"
+
   publish:
     name: publish release
-    needs: build
+    needs: [build, check-artifacts]
     # Only a tag publishes. A manual run stops after build + attest.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
