@@ -68,7 +68,10 @@ jobs:
           printf '#!/bin/sh\nexit 22\n' > "$stub/bin/curl"
           printf '#!/bin/sh\necho "stub cargo $*"\n' > "$stub/bin/cargo"
           chmod +x "$stub/bin/"*
-          PATH="$stub/bin:/usr/bin:/bin" sh scripts/fetch-or-build.sh 2>&1 | tee out.txt
+          # HOME must not point at a real ~/.cargo/env: sourcing it would put
+          # the real cargo ahead of the stub and the assertion below would be
+          # testing nothing.
+          HOME=/nonexistent PATH="$stub/bin:/usr/bin:/bin" sh scripts/fetch-or-build.sh 2>&1 | tee out.txt
           grep -q 'building from source instead' out.txt
           grep -q 'stub cargo build --release --locked' out.txt
 
@@ -97,7 +100,8 @@ jobs:
           printf '#!/bin/sh\necho "stub cargo $*"\n' > "$stub/bin/cargo"
           chmod +x "$stub/bin/"*
           set +e
-          REL="$stub/rel" PATH="$stub/bin:/usr/bin:/bin" sh "$stub/root/scripts/fetch-or-build.sh" > out.txt 2>&1
+          REL="$stub/rel" HOME=/nonexistent PATH="$stub/bin:/usr/bin:/bin" \
+            sh "$stub/root/scripts/fetch-or-build.sh" > out.txt 2>&1
           code=$?
           set -e
           cat out.txt
