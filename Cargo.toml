@@ -1,8 +1,8 @@
 [package]
 name = "herdr-worktree-setup"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "herdr plugin: make a new git worktree immediately usable (copy .env & dev state, clone dependency caches, mise trust, direnv allow, install deps) with a live TUI"
 license = "MIT"
 repository = "https://github.com/jtnovellis/herdr-worktree-setup"

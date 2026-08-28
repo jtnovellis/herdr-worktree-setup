@@ -22,9 +22,25 @@ const TICK: Duration = Duration::from_millis(50);
 pub fn run(job: Job, cfg: Config) -> Result<i32> {
     let pane_id = std::env::var("HERDR_PANE_ID").ok();
     let lock = job.lock_path(&job::state_dir());
-    // Held for the lifetime of this pane; released by the kernel if we die.
-    let _lock = Lock::acquire(&lock, pane_id.clone()).ok().flatten();
     let herdr = Herdr::from_env();
+    // Held for the lifetime of this pane; released by the kernel if we die.
+    // Losing the race means another pane is already setting this worktree up —
+    // running a second install into the same tree would corrupt it.
+    let _lock = match Lock::acquire(&lock, pane_id.clone()) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            let live = Lock::read_live(&lock);
+            if let Some(pane) = live.as_ref().and_then(|l| l.pane_id.as_deref()) {
+                let _ = herdr.plugin_pane_focus(pane);
+            }
+            println!(
+                "worktree-setup: setup is already running for {} in another pane",
+                job.target.display()
+            );
+            return Ok(0);
+        }
+        Err(err) => return Err(err),
+    };
 
     let worker = Worker::spawn(job, cfg.clone());
     let mut app = App::new(&cfg);

@@ -1,10 +1,10 @@
 {
-  "event": "worktree.created",
+  "event": "worktree_created",
   "data": {
     "type": "worktree_created",
     "workspace": {
       "workspace_id": "w9",
-      "number": 7,
+      "number": 8,
       "label": "feature/x",
       "focused": true,
       "pane_count": 1,
@@ -27,7 +27,7 @@
       "is_prunable": false,
       "is_linked_worktree": true,
       "open_workspace_id": "w9",
-      "label": "feature/x"
+      "label": "clyras"
     }
   }
 }

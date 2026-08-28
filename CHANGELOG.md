@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.2
+
+Correctness and honesty pass over the 0.1.1 security work, with render-level
+tests so the UI parts cannot regress silently.
+
+### Fixed
+
+- **Configuration refusals were effectively invisible.** Warnings — including
+  "this branch shipped a config, which was ignored" and "`install` can only be
+  disabled by a repo config" — rendered only while the first step had produced
+  no output, so in practice nobody ever saw them. They now have their own strip
+  under the header, and there are render tests asserting they survive a full
+  log pane.
+- **Two panes could set up the same worktree at once.** A pane that lost the
+  lock race ran the pipeline anyway, so two dependency installs could land in
+  one tree. It now focuses the pane that holds the lock and exits.
+- **The housekeeping sweep could delete a live lock.** Lock files aged out after
+  a week like any other file, so a pane left open that long lost its lock and a
+  second setup could start. Locks are now decided by whether anyone holds them;
+  only job records age out.
+- **Any herdr event was treated as a worktree creation.** The event name is now
+  checked — accepting both spellings herdr uses, the dotted `worktree.created`
+  of manifests and the `worktree_created` of the JSON envelope — and anything
+  else is reported and ignored. The test fixture is now a capture of the real
+  envelope rather than a hand-written approximation of it.
+- **The declared MSRV was wrong** — `rust-version` said 1.85 while the
+  dependency graph requires 1.88, so a build from source on 1.85 failed with a
+  dependency error instead of a clear message. Corrected, and CI now enforces
+  it on the 1.88 toolchain.
+- CI passed `toolchain` to the Rust setup action implicitly, which a SHA pin
+  makes ambiguous; every job now names its toolchain.
+- README showed the pre-0.1.1 shell-wrapped install line and understated the
+  distinction between installs (argv, no shell) and `[[steps]]` (a shell, by
+  design).
+
 ## 0.1.1
 
 Security release. **0.1.0 contains a command injection; upgrade.** Found by an

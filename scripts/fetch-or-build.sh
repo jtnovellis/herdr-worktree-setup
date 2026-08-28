@@ -37,7 +37,7 @@ build_from_source() {
   fi
   if ! have cargo; then
     echo "$bin: no prebuilt binary for this platform/version and cargo was not found." >&2
-    echo "Install Rust (https://rustup.rs) and re-run: herdr plugin install $repo" >&2
+    echo "Install Rust 1.88+ (https://rustup.rs) and re-run: herdr plugin install $repo" >&2
     exit 1
   fi
   echo "$bin: building from source with cargo…" >&2

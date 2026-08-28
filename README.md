@@ -29,7 +29,7 @@ is optional.
 │✓ 5  bun install        done                                       0.5s │
 └────────────────────────────────────────────────────────────────────────┘
 ┌ output: bun install ───────────────────────────────────────────────────┐
-│$ /bin/sh -c 'bun install'                                              │
+│$ bun install                                                           │
 │Checked 1364 installs across 1513 packages (no changes) [513.00ms]      │
 └────────────────────────────────────────────────────────────────────────┘
  j/k step  J/K scroll  g/G top/end  q close       closing in 5s (any key cancels)
@@ -44,7 +44,7 @@ herdr plugin install jtnovellis/herdr-worktree-setup
 The build step downloads a prebuilt binary for macOS (arm64, x86_64) or Linux
 (x86_64, aarch64) over https and verifies its SHA-256; a mismatch aborts the
 install. If there is no prebuilt binary for your platform it builds from source
-with `cargo` (Rust 1.85+). Release binaries carry Sigstore build provenance:
+with `cargo` (Rust 1.88+). Release binaries carry Sigstore build provenance:
 
 ```sh
 gh attestation verify --repo jtnovellis/herdr-worktree-setup \
@@ -177,9 +177,13 @@ if = "prisma/schema.prisma"      # only when this path exists in the worktree
 continue_on_error = true         # a failure does not mark the setup as failed
 ```
 
-Steps run in the worktree via `/bin/sh -c`, wrapped in `direnv exec` and
-`mise exec --` when applicable, with `HWS_SOURCE`, `HWS_TARGET`, `HWS_BRANCH`
-and `HWS_WORKSPACE_ID` in the environment.
+Custom steps run in the worktree through `/bin/sh -c`, because shell syntax is
+the point of them. Dependency installs do not: their command comes from a fixed
+allowlist and is executed as argv, so nothing in the repository can be
+reinterpreted as syntax. Both are wrapped in `direnv exec` and `mise exec --`
+when applicable, and run with `HWS_SOURCE`, `HWS_TARGET`, `HWS_BRANCH` and
+`HWS_WORKSPACE_ID` in the environment. A step that outlives
+`step_timeout_secs` is terminated along with anything it forked.
 
 ### Environment resolution
 

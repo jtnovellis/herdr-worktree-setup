@@ -49,7 +49,6 @@ pub enum JobSource {
 #[derive(Deserialize)]
 struct Envelope {
     #[serde(default)]
-    #[allow(dead_code)]
     event: String,
     data: EventData,
 }
@@ -57,10 +56,22 @@ struct Envelope {
 #[derive(Deserialize)]
 struct EventData {
     #[serde(rename = "type", default)]
-    #[allow(dead_code)]
     kind: String,
     workspace: Option<WorkspaceInfo>,
     worktree: Option<WorktreeInfo>,
+}
+
+/// The only event this plugin acts on. Anything else — a hook someone added by
+/// hand, or a future herdr event — is reported and ignored rather than being
+/// interpreted as a worktree creation.
+///
+/// herdr spells this two ways: manifests match on the dotted `worktree.created`,
+/// while the JSON envelope carries the snake_case `worktree_created` in both
+/// `event` and `data.type` (captured from herdr 0.8.2). Accept either.
+const WORKTREE_CREATED: &str = "worktree_created";
+
+fn is_worktree_created(name: &str) -> bool {
+    name.replace('.', "_") == WORKTREE_CREATED
 }
 
 #[derive(Deserialize)]
@@ -126,10 +137,24 @@ impl Job {
     /// Parse `HERDR_PLUGIN_EVENT_JSON` (full envelope, or bare `data`).
     pub fn from_event_json(raw: &str) -> Result<JobSource> {
         let data: EventData = match serde_json::from_str::<Envelope>(raw) {
-            Ok(env) => env.data,
+            Ok(env) => {
+                if !env.event.is_empty() && !is_worktree_created(&env.event) {
+                    return Ok(JobSource::Skip(format!(
+                        "event `{}` is not a worktree creation",
+                        env.event
+                    )));
+                }
+                env.data
+            }
             Err(_) => serde_json::from_str::<EventData>(raw)
                 .context("HERDR_PLUGIN_EVENT_JSON is not a worktree event")?,
         };
+        if !data.kind.is_empty() && !is_worktree_created(&data.kind) {
+            return Ok(JobSource::Skip(format!(
+                "event data `{}` is not a worktree creation",
+                data.kind
+            )));
+        }
         let ws = data.workspace;
         let wt = data.worktree;
         let (target, branch, linked_wt) = match &wt {
@@ -303,7 +328,12 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".config/herdr-worktree-setup"))
 }
 
-/// Remove job/lock files older than a week (best effort).
+/// Tidy the jobs directory (best effort).
+///
+/// Lock files are decided by whether anyone still holds them, never by age: a
+/// pane left open for a week is still live, and removing its lock would let a
+/// second setup run against the same worktree. `Lock::read_live` already drops
+/// the stale ones. Job records are plain data and age out.
 pub fn sweep_old(state_dir: &Path) {
     let dir = state_dir.join("jobs");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -311,6 +341,12 @@ pub fn sweep_old(state_dir: &Path) {
     };
     let cutoff = Duration::from_secs(7 * 24 * 3600);
     for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "pid") {
+            // Consulting it removes it if and only if nobody holds it.
+            let _ = Lock::read_live(&path);
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(modified) = meta.modified() else {
             continue;
@@ -320,7 +356,7 @@ pub fn sweep_old(state_dir: &Path) {
             .map(|age| age > cutoff)
             .unwrap_or(false)
         {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -425,6 +461,94 @@ mod tests {
             panic!()
         };
         assert!(!job.workspace_focused);
+    }
+
+    /// Only `worktree.created` may be interpreted as a worktree creation.
+    #[test]
+    fn other_events_are_skipped_not_misread() {
+        // The captured envelope is the ground truth: herdr sends snake_case in
+        // both fields. Regressing this stops the plugin firing at all.
+        assert!(EVENT.contains("\"event\": \"worktree_created\""));
+        assert!(matches!(
+            Job::from_event_json(EVENT).unwrap(),
+            JobSource::Ready(_)
+        ));
+        // The dotted spelling used by manifests is accepted too.
+        let dotted = EVENT.replace(
+            "\"event\": \"worktree_created\"",
+            "\"event\": \"worktree.created\"",
+        );
+        assert!(matches!(
+            Job::from_event_json(&dotted).unwrap(),
+            JobSource::Ready(_)
+        ));
+        for wrong in [
+            EVENT.replace(
+                "\"event\": \"worktree_created\"",
+                "\"event\": \"worktree_removed\"",
+            ),
+            EVENT.replace(
+                "\"type\": \"worktree_created\"",
+                "\"type\": \"worktree_removed\"",
+            ),
+        ] {
+            match Job::from_event_json(&wrong).unwrap() {
+                JobSource::Skip(reason) => assert!(reason.contains("removed"), "{reason}"),
+                JobSource::Ready(_) => panic!("acted on the wrong event"),
+            }
+        }
+    }
+
+    /// A pane open for a week is still live; ageing out its lock would let a
+    /// second setup run against the same worktree.
+    #[test]
+    fn the_sweep_keeps_held_locks_and_drops_stale_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+
+        let held = jobs.join("live.pid");
+        let guard = Lock::acquire(&held, None).unwrap().expect("acquired");
+        let stale = jobs.join("stale.pid");
+        std::fs::write(&stale, r#"{"pid":1,"pane_id":null}"#).unwrap();
+        let record = jobs.join("old.json");
+        std::fs::write(&record, "{}").unwrap();
+        // Age everything well past the cutoff.
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+        for p in [&held, &stale, &record] {
+            let f = File::options().write(true).open(p).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(long_ago))
+                .unwrap();
+        }
+
+        sweep_old(dir.path());
+        assert!(held.exists(), "a held lock was swept away");
+        assert!(!stale.exists(), "a stale lock survived");
+        assert!(!record.exists(), "an aged-out job record survived");
+        drop(guard);
+    }
+
+    /// Two panes must never set up the same worktree at once.
+    #[test]
+    fn a_second_acquire_is_refused_while_the_first_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs").join("w1.pid");
+        let first = Lock::acquire(&path, Some("w1:p2".into()))
+            .unwrap()
+            .expect("first");
+        assert!(
+            Lock::acquire(&path, Some("w1:p3".into()))
+                .unwrap()
+                .is_none(),
+            "a second holder was allowed in"
+        );
+        assert_eq!(
+            Lock::read_live(&path).unwrap().pane_id.as_deref(),
+            Some("w1:p2"),
+            "the incumbent pane should still be identifiable, to focus it"
+        );
+        drop(first);
+        assert!(Lock::acquire(&path, None).unwrap().is_some(), "released");
     }
 
     #[test]

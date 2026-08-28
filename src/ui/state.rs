@@ -167,6 +167,11 @@ impl App {
         })
     }
 
+    /// Configuration refusals and ignored files, reported by the worker.
+    pub fn warnings(&self) -> &[String] {
+        self.header.as_ref().map_or(&[], |h| h.warnings.as_slice())
+    }
+
     pub fn has_failures(&self) -> bool {
         self.steps.iter().any(|s| s.status == Status::Failed)
     }
