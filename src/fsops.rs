@@ -43,6 +43,9 @@ pub enum Outcome {
     TooLarge {
         bytes: u64,
     },
+    /// Refused for safety — e.g. the destination path crosses a symlink, or the
+    /// source is not a regular file. Never a transient error.
+    Refused(String),
     Failed(String),
 }
 
@@ -59,6 +62,39 @@ pub fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Join `rel` under `target` without ever traversing a symlink.
+///
+/// SECURITY: `target` is a freshly checked-out branch, and git stores a symlink
+/// as an ordinary tracked file. `target.join(rel)` is string concatenation, and
+/// every syscall that follows (`create_dir_all`, `clonefile`, `fs::copy`)
+/// resolves intermediate components — so a committed `packages -> /elsewhere`
+/// would redirect the whole copy, secrets included, outside the worktree.
+/// Walking the components ourselves keeps every write inside it.
+pub fn contained_dst(target: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut cur = target.to_path_buf();
+    let mut parts = rel.split('/').filter(|p| !p.is_empty()).peekable();
+    if parts.peek().is_none() {
+        return Err("empty relative path".to_string());
+    }
+    while let Some(part) = parts.next() {
+        if part == "." || part == ".." {
+            return Err(format!("`{rel}` contains a `{part}` component"));
+        }
+        cur.push(part);
+        // The last component may legitimately be a symlink — we then skip the
+        // item as "already present". An intermediate one must never be followed.
+        if parts.peek().is_some()
+            && std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(format!(
+                "{} is a symlink; refusing to write through it",
+                cur.display()
+            ));
+        }
+    }
+    Ok(cur)
 }
 
 pub struct Copier {
@@ -143,11 +179,14 @@ impl Copier {
             return Outcome::Failed("no action".into());
         };
         let src = self.source.join(&item.rel);
-        let dst = self.target.join(&item.rel);
+        let dst = match contained_dst(&self.target, &item.rel) {
+            Ok(dst) => dst,
+            Err(err) => return Outcome::Refused(err),
+        };
         if std::fs::symlink_metadata(&dst).is_ok() {
             return Outcome::Exists;
         }
-        if let Err(err) = ensure_parent(&dst) {
+        if let Err(err) = self.ensure_parent(&item.rel) {
             return Outcome::Failed(err.to_string());
         }
         match action {
@@ -173,6 +212,14 @@ impl Copier {
         if link_target.is_absolute() {
             for prefix in &self.source_prefixes {
                 if let Ok(rest) = link_target.strip_prefix(prefix) {
+                    // A remainder containing `..` names a different file once
+                    // re-rooted, so leave such a link exactly as it was.
+                    if rest
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return link_target.to_path_buf();
+                    }
                     return self.target.join(rest);
                 }
             }
@@ -195,37 +242,77 @@ impl Copier {
         }
     }
 
-    fn copy_file(&mut self, src: &Path, dst: &Path) -> Outcome {
-        let bytes = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-        match self.mode {
-            CloneMode::Reflink => match reflink_copy::reflink_or_copy(src, dst) {
-                Ok(None) => Outcome::Done {
-                    method: Method::Reflink,
-                    files: 1,
-                    bytes,
-                },
-                Ok(Some(n)) => {
-                    self.plain_copied += n;
-                    Outcome::Done {
-                        method: Method::Copy,
-                        files: 1,
-                        bytes: n,
-                    }
-                }
-                Err(err) => Outcome::Failed(format!("copy: {err}")),
-            },
-            CloneMode::Copy => match std::fs::copy(src, dst) {
-                Ok(n) => {
-                    self.plain_copied += n;
-                    Outcome::Done {
-                        method: Method::Copy,
-                        files: 1,
-                        bytes: n,
-                    }
-                }
-                Err(err) => Outcome::Failed(format!("copy: {err}")),
-            },
+    /// `Some(TooLarge)` when materialising `bytes` real bytes would breach a
+    /// cap. Reflinked/cloned bytes cost no disk and are never charged.
+    fn cap_exceeded(&self, bytes: u64) -> Option<Outcome> {
+        if bytes > self.per_dir_cap || self.plain_copied.saturating_add(bytes) > self.total_cap {
+            Some(Outcome::TooLarge { bytes })
+        } else {
+            None
         }
+    }
+
+    fn copy_file(&mut self, src: &Path, dst: &Path) -> Outcome {
+        let meta = match std::fs::metadata(src) {
+            Ok(meta) => meta,
+            Err(err) => return Outcome::Failed(format!("stat: {err}")),
+        };
+        // Anything that is not a regular file — a FIFO above all — would block
+        // `open(2)` forever. `git ls-files` never reports one, but the
+        // one-level descend into an excluded directory reads the filesystem.
+        if !meta.is_file() {
+            return Outcome::Refused("not a regular file".to_string());
+        }
+        let bytes = meta.len();
+        if self.mode == CloneMode::Reflink {
+            match reflink_copy::reflink(src, dst) {
+                Ok(()) => {
+                    return Outcome::Done {
+                        method: Method::Reflink,
+                        files: 1,
+                        bytes,
+                    }
+                }
+                Err(err) if !is_unsupported(&err) => {
+                    return Outcome::Failed(format!("copy: {err}"))
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(too_large) = self.cap_exceeded(bytes) {
+            return too_large;
+        }
+        match std::fs::copy(src, dst) {
+            Ok(n) => {
+                self.plain_copied += n;
+                Outcome::Done {
+                    method: Method::Copy,
+                    files: 1,
+                    bytes: n,
+                }
+            }
+            Err(err) => Outcome::Failed(format!("copy: {err}")),
+        }
+    }
+
+    /// Create the parents of `rel` inside the target, mirroring each source
+    /// directory's mode. Without that, a `drwx------` directory holding secrets
+    /// is recreated as `drwxr-xr-x` by the umask.
+    fn ensure_parent(&self, rel: &str) -> io::Result<()> {
+        let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+        let mut dir = self.target.clone();
+        let mut src_dir = self.source.clone();
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            dir.push(part);
+            src_dir.push(part);
+            if !dir.exists() {
+                std::fs::create_dir(&dir)?;
+                if let Ok(meta) = std::fs::metadata(&src_dir) {
+                    let _ = std::fs::set_permissions(&dir, meta.permissions());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn clone_tree(&mut self, rel: &str, src: &Path, dst: &Path) -> Outcome {
@@ -260,10 +347,19 @@ impl Copier {
     /// Probe whether a reflink of one file into `dst`'s parent works.
     fn reflink_works(&self, probe_file: &Path, dst: &Path) -> bool {
         let parent = dst.parent().unwrap_or(&self.target);
-        let tmp = parent.join(format!(".hws-probe-{}", std::process::id()));
-        let ok = reflink_copy::reflink(probe_file, &tmp).is_ok();
-        let _ = std::fs::remove_file(&tmp);
-        ok
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp = parent.join(format!(".hws-probe-{}-{nonce:08x}", std::process::id()));
+        // Unlink only when the reflink succeeded — i.e. only a file we created.
+        match reflink_copy::reflink(probe_file, &tmp) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn walk_copy(&mut self, rel: &str, src: &Path, dst: &Path) -> io::Result<Outcome> {
@@ -330,7 +426,17 @@ impl Copier {
                     match reflink_copy::reflink(entry.path(), &out) {
                         Ok(()) => entry.metadata().map(|m| m.len()).unwrap_or(0),
                         Err(err) if !is_unsupported(&err) => return Err(err),
-                        Err(_) => std::fs::copy(entry.path(), &out)?,
+                        Err(_) => {
+                            // Reflink worked for the probe but not for this
+                            // file: these are real bytes, so charge and cap them.
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            if self.cap_exceeded(size).is_some() {
+                                return Ok(Outcome::TooLarge { bytes: size });
+                            }
+                            let n = std::fs::copy(entry.path(), &out)?;
+                            self.plain_copied += n;
+                            n
+                        }
                     }
                 } else {
                     let n = std::fs::copy(entry.path(), &out)?;
@@ -352,10 +458,12 @@ impl Copier {
     /// (`.turbo/daemon`) that the atomic clone could not skip. Bounded depth.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn post_prune(&self, rel: &str, dst: &Path) {
+        // No depth bound: `exclude` is user- and repo-extensible, and an exclude
+        // that silently stops applying below some depth is worse than none at
+        // all. Pruned subtrees are skipped, so the walk stays cheap.
         let mut walker = walkdir::WalkDir::new(dst)
             .follow_links(false)
             .min_depth(1)
-            .max_depth(3)
             .into_iter();
         while let Some(Ok(entry)) = walker.next() {
             let sub = entry.path().strip_prefix(dst).unwrap_or(entry.path());
@@ -398,18 +506,11 @@ impl Copier {
     }
 }
 
-fn ensure_parent(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::discover::{list_ignored, testrepo};
-    use crate::planner::{CopyPlan, Group, ItemState};
+    use crate::planner::{CopyPlan, Group, ItemState, PlanItem};
 
     fn setup(mode: CloneMode) -> (tempfile::TempDir, PathBuf, PathBuf, CopyPlan, Copier) {
         let tmp = tempfile::tempdir().unwrap();
@@ -529,6 +630,163 @@ mod tests {
         );
         assert!(plan.items.iter().all(|i| i.rel != "wip.txt"));
         assert!(plan.items.iter().any(|i| i.state == ItemState::Pending));
+    }
+
+    /// A branch may commit a symlink at any path component. Following it would
+    /// place the copy — secrets included — wherever the branch chooses.
+    #[test]
+    fn refuses_to_write_through_a_symlinked_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = testrepo::fixture(tmp.path());
+        let target = tmp.path().join("wt");
+        let outside = tmp.path().join("OUTSIDE");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Source has gitignored state under packages/ui/.
+        testrepo::write(&repo, "packages/ui/.env.local", "STRIPE=sk_live_x\n");
+        testrepo::write(&repo, "packages/ui/node_modules/dep/i.js", "x\n");
+        // The branch checked out `packages` as a symlink pointing elsewhere.
+        std::os::unix::fs::symlink(&outside, target.join("packages")).unwrap();
+
+        let cfg = Config::default();
+        let rules = Rules::from_config(&cfg).unwrap();
+        let cands = list_ignored(Path::new("git"), &repo).unwrap();
+        let plan = CopyPlan::build(&repo, &target, cands, &rules);
+        let mut copier = Copier::new(&repo, &target, &cfg, rules);
+
+        let blocked: Vec<&str> = plan
+            .items
+            .iter()
+            .filter(|i| matches!(i.state, ItemState::Blocked(_)))
+            .map(|i| i.rel.as_str())
+            .collect();
+        assert!(
+            blocked.contains(&"packages/ui/.env.local"),
+            "plan did not mark the escape: {blocked:?}"
+        );
+        assert!(blocked.contains(&"packages/ui/node_modules"));
+
+        // Even applied directly, the copier refuses.
+        for rel in ["packages/ui/.env.local", "packages/ui/node_modules"] {
+            let item = plan.items.iter().find(|i| i.rel == rel).unwrap();
+            match copier.apply(item) {
+                Outcome::Refused(reason) => assert!(reason.contains("symlink"), "{reason}"),
+                other => panic!("{rel} was not refused: {other:?}"),
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "data landed outside the worktree"
+        );
+        // Everything the plan can reach safely still copies.
+        for item in plan.pending_in(Group::State) {
+            assert!(
+                matches!(copier.apply(item), Outcome::Done { .. }),
+                "{}",
+                item.rel
+            );
+        }
+        assert!(target.join(".env").is_file());
+    }
+
+    /// `git ls-files` never reports a FIFO, but the one-level descend into an
+    /// excluded directory reads the filesystem — and `open`ing a FIFO blocks
+    /// forever, which would wedge the pane with no way out.
+    #[test]
+    fn refuses_a_fifo_instead_of_blocking_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = testrepo::fixture(tmp.path());
+        let target = tmp.path().join("wt");
+        std::fs::create_dir_all(&target).unwrap();
+        let fifo = repo.join("dist/.env.local");
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let cfg = Config::default();
+        let rules = Rules::from_config(&cfg).unwrap();
+        let cands = list_ignored(Path::new("git"), &repo).unwrap();
+        let plan = CopyPlan::build(&repo, &target, cands, &rules);
+        // The planner drops it outright…
+        assert!(
+            plan.items.iter().all(|i| i.rel != "dist/.env.local"),
+            "a FIFO was planned"
+        );
+        // …and the copier would refuse it even if something else planned it.
+        let mut copier = Copier::new(&repo, &target, &cfg, rules);
+        let item = PlanItem {
+            rel: "dist/.env.local".into(),
+            is_dir: false,
+            is_symlink: false,
+            action: Some(crate::planner::PlanAction::Copy),
+            state: ItemState::Pending,
+        };
+        assert!(matches!(copier.apply(&item), Outcome::Refused(_)));
+    }
+
+    /// `exclude` is the only "never copy this" control there is; it must hold
+    /// at every depth, including under the whole-tree clone fast path.
+    #[test]
+    fn exclude_applies_at_any_depth_under_a_cloned_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = testrepo::fixture(tmp.path());
+        let target = tmp.path().join("wt");
+        std::fs::create_dir_all(&target).unwrap();
+        testrepo::write(&repo, "node_modules/a/b/c/d/.turbo/daemon/pid", "1\n");
+        testrepo::write(&repo, "node_modules/a/b/c/d/keep.js", "x\n");
+
+        let cfg = Config::default();
+        let rules = Rules::from_config(&cfg).unwrap();
+        let cands = list_ignored(Path::new("git"), &repo).unwrap();
+        let plan = CopyPlan::build(&repo, &target, cands, &rules);
+        let mut copier = Copier::new(&repo, &target, &cfg, rules);
+        let nm = plan.items.iter().find(|i| i.rel == "node_modules").unwrap();
+        assert!(matches!(copier.apply(nm), Outcome::Done { .. }));
+        assert!(target.join("node_modules/a/b/c/d/keep.js").is_file());
+        assert!(
+            !target.join("node_modules/a/b/c/d/.turbo/daemon").exists(),
+            "a deep exclude was not applied"
+        );
+    }
+
+    /// A directory holding secrets must not be recreated world-readable.
+    #[test]
+    fn created_parent_directories_keep_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = testrepo::fixture(tmp.path());
+        let target = tmp.path().join("wt");
+        std::fs::create_dir_all(&target).unwrap();
+        testrepo::write(&repo, "secrets/deep/.env.local", "K=v\n");
+        std::fs::set_permissions(repo.join("secrets"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(
+            repo.join("secrets/deep"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        testrepo::git(&repo, &["check-ignore", "-q", "secrets/deep/.env.local"]);
+
+        let cfg = Config::default();
+        let rules = Rules::from_config(&cfg).unwrap();
+        let cands = list_ignored(Path::new("git"), &repo).unwrap();
+        let plan = CopyPlan::build(&repo, &target, cands, &rules);
+        let mut copier = Copier::new(&repo, &target, &cfg, rules);
+        let item = plan
+            .items
+            .iter()
+            .find(|i| i.rel == "secrets/deep/.env.local")
+            .expect("planned");
+        assert!(matches!(copier.apply(item), Outcome::Done { .. }));
+        for rel in ["secrets", "secrets/deep"] {
+            let mode = std::fs::metadata(target.join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{rel} was widened to {mode:o}");
+        }
     }
 
     #[test]

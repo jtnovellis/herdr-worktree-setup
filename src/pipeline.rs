@@ -104,6 +104,7 @@ pub struct Pipeline {
     use_direnv: bool,
     mise_bin: Option<PathBuf>,
     direnv_bin: Option<PathBuf>,
+    step_timeout: Option<Duration>,
 }
 
 fn shorten_home(path: &std::path::Path) -> String {
@@ -208,9 +209,9 @@ impl Pipeline {
                 via.push("mise");
             }
             let hint = if via.is_empty() {
-                install.command.clone()
+                install.label.clone()
             } else {
-                format!("{} (via {})", install.command, via.join(" + "))
+                format!("{} (via {})", install.label, via.join(" + "))
             };
             steps.push(Step {
                 meta: StepMeta {
@@ -253,6 +254,8 @@ impl Pipeline {
             set(k, v.clone());
         }
 
+        let step_timeout =
+            (cfg.step_timeout_secs > 0).then(|| Duration::from_secs(cfg.step_timeout_secs));
         let outcomes = vec![None; steps.len()];
         Ok(Pipeline {
             job,
@@ -269,6 +272,7 @@ impl Pipeline {
             use_direnv,
             mise_bin,
             direnv_bin,
+            step_timeout,
         })
     }
 
@@ -366,6 +370,12 @@ impl Pipeline {
 
     fn run_copy(&mut self, idx: usize, group: Group, tx: &Sender<WorkerEvent>) -> Outcome {
         let items: Vec<PlanItem> = self.plan.items_in(group).into_iter().cloned().collect();
+        let blocked: Vec<(String, String)> = self
+            .plan
+            .blocked_in(group)
+            .into_iter()
+            .map(|(item, reason)| (item.rel.clone(), reason.to_string()))
+            .collect();
         let pending: Vec<&PlanItem> = items
             .iter()
             .filter(|i| i.state == ItemState::Pending)
@@ -377,7 +387,13 @@ impl Pipeline {
                 format!("= {}  (already in worktree, kept)", item.rel),
             );
         }
+        for (rel, reason) in &blocked {
+            self.line(tx, idx, format!("! {rel}  refused: {reason}"));
+        }
         if pending.is_empty() {
+            if !blocked.is_empty() {
+                return Outcome::Failed(format!("{} refused for safety", blocked.len()));
+            }
             return Outcome::Skipped(match group {
                 Group::State => "nothing to copy".into(),
                 Group::Caches => "nothing to clone".into(),
@@ -395,13 +411,18 @@ impl Pipeline {
                 };
                 self.line(tx, idx, format!("~ would {verb} {}{suffix}", item.rel));
             }
+            if !blocked.is_empty() {
+                return Outcome::Failed(format!("{} refused for safety", blocked.len()));
+            }
             return Outcome::Ok(format!("{} planned", pending.len()));
         }
         let mut done = 0usize;
         let mut failed = 0usize;
+        let mut refused = blocked.len();
         let mut files = 0u64;
         let mut bytes = 0u64;
         let mut methods: Vec<Method> = Vec::new();
+        let mut copied: Vec<String> = Vec::new();
         for item in &pending {
             if self.abort.load(Ordering::SeqCst) {
                 break;
@@ -416,6 +437,7 @@ impl Pipeline {
                     done += 1;
                     files += f;
                     bytes += b;
+                    copied.push(item.rel.clone());
                     if !methods.contains(method) {
                         methods.push(*method);
                     }
@@ -431,6 +453,10 @@ impl Pipeline {
                     }
                 }
                 FsOutcome::Exists => format!("= {}  (already in worktree, kept)", item.rel),
+                FsOutcome::Refused(reason) => {
+                    refused += 1;
+                    format!("! {}  refused: {reason}", item.rel)
+                }
                 FsOutcome::TooLarge { bytes } => format!(
                     "! {}  skipped: {} exceeds the copy cap and this volume cannot reflink",
                     item.rel,
@@ -443,8 +469,14 @@ impl Pipeline {
             };
             self.line(tx, idx, text);
         }
+        if group == Group::State {
+            self.warn_about_untracked_secrets(idx, &copied, tx);
+        }
         if failed > 0 {
             return Outcome::Failed(format!("{failed} of {} failed", pending.len()));
+        }
+        if refused > 0 {
+            return Outcome::Failed(format!("{refused} refused for safety"));
         }
         let how = methods
             .iter()
@@ -464,6 +496,74 @@ impl Pipeline {
         })
     }
 
+    /// Whether a file is gitignored in the source is what made it a candidate;
+    /// whether it stays ignored in the worktree is decided by the branch. A
+    /// branch that drops `.env` from its `.gitignore` turns a routine
+    /// `git add -A` into a commit of the user's live credentials, so say so.
+    fn warn_about_untracked_secrets(
+        &self,
+        idx: usize,
+        copied: &[String],
+        tx: &Sender<WorkerEvent>,
+    ) {
+        if copied.is_empty() {
+            return;
+        }
+        let mut child = match std::process::Command::new(self.env.git())
+            .arg("-C")
+            .arg(&self.job.target)
+            .args(["--literal-pathspecs", "check-ignore", "--stdin", "-z"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let payload: Vec<u8> = copied
+                .iter()
+                .flat_map(|rel| {
+                    let mut bytes = rel.as_bytes().to_vec();
+                    bytes.push(0);
+                    bytes
+                })
+                .collect();
+            let _ = stdin.write_all(&payload);
+        }
+        let Ok(out) = child.wait_with_output() else {
+            return;
+        };
+        let ignored: std::collections::HashSet<&str> = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .collect();
+        let exposed: Vec<&String> = copied
+            .iter()
+            .filter(|rel| !ignored.contains(rel.as_str()))
+            .collect();
+        if exposed.is_empty() {
+            return;
+        }
+        self.line(
+            tx,
+            idx,
+            format!(
+                "! {} copied file(s) are NOT gitignored on this branch — `git add -A` would commit them: {}",
+                exposed.len(),
+                exposed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
     /// Run a command for a step, streaming its output; `Ok(exit_code)`.
     fn run_cmd(
         &self,
@@ -476,6 +576,7 @@ impl Pipeline {
             argv,
             cwd: self.job.target.clone(),
             env: self.step_env.clone(),
+            timeout: self.step_timeout,
         };
         let mut emit = |text: String| {
             let _ = tx.send(WorkerEvent::Line { idx, text });
@@ -508,6 +609,7 @@ impl Pipeline {
                 tx,
             ) {
                 Ok(0) => trusted += 1,
+                Ok(exec::TIMED_OUT) => return Outcome::Failed(self.timeout_message()),
                 Ok(code) => return Outcome::Failed(format!("mise trust exited {code}")),
                 Err(err) => return Outcome::Failed(err),
             }
@@ -541,13 +643,40 @@ impl Pipeline {
             tx,
         ) {
             Ok(0) => Outcome::Ok("allowed".into()),
+            Ok(exec::TIMED_OUT) => Outcome::Failed(self.timeout_message()),
             Ok(code) => Outcome::Failed(format!("direnv allow exited {code}")),
             Err(err) => Outcome::Failed(err),
         }
     }
 
+    /// The resolved `direnv`/`mise` binaries, when this repo uses them. Absolute
+    /// paths, so a step's environment cannot swap the tool manager itself.
+    fn tool_bins(&self) -> (Option<&std::path::Path>, Option<&std::path::Path>) {
+        (
+            self.use_direnv
+                .then_some(self.direnv_bin.as_deref())
+                .flatten(),
+            self.use_mise.then_some(self.mise_bin.as_deref()).flatten(),
+        )
+    }
+
+    /// A shell command line — only for user/repo-authored `[[steps]]`.
     fn wrapped(&self, command: &str) -> Vec<String> {
-        exec::shell_argv(command, &self.job.target, self.use_direnv, self.use_mise)
+        let (direnv, mise) = self.tool_bins();
+        exec::shell_argv(command, &self.job.target, direnv, mise)
+    }
+
+    /// An install command: argv, executed directly, never through a shell.
+    fn wrapped_argv(&self, argv: &[String]) -> Vec<String> {
+        let (direnv, mise) = self.tool_bins();
+        exec::direct_argv(argv, &self.job.target, direnv, mise)
+    }
+
+    fn timeout_message(&self) -> String {
+        match self.step_timeout {
+            Some(limit) => format!("timed out after {}s", limit.as_secs()),
+            None => "timed out".to_string(),
+        }
     }
 
     fn run_install(&self, idx: usize, install: &InstallCmd, tx: &Sender<WorkerEvent>) -> Outcome {
@@ -560,12 +689,13 @@ impl Pipeline {
                 install.tool, self.env
             ));
         }
-        let argv = self.wrapped(&install.command);
+        let argv = self.wrapped_argv(&install.argv);
         if self.job.dry_run {
             return Outcome::Skipped(format!("dry run: {}", exec::display(&argv)));
         }
         match self.run_cmd(idx, argv, tx) {
             Ok(0) => Outcome::Ok("done".into()),
+            Ok(exec::TIMED_OUT) => Outcome::Failed(self.timeout_message()),
             Ok(code) => Outcome::Failed(format!("exited {code}")),
             Err(err) => Outcome::Failed(err),
         }
@@ -586,6 +716,7 @@ impl Pipeline {
         }
         match self.run_cmd(idx, argv, tx) {
             Ok(0) => Outcome::Ok("done".into()),
+            Ok(exec::TIMED_OUT) => Outcome::Failed(self.timeout_message()),
             Ok(code) if def.continue_on_error => {
                 Outcome::Skipped(format!("exited {code} (ignored)"))
             }
@@ -653,7 +784,7 @@ impl Worker {
     pub fn abort(&self) {
         self.abort.store(true, Ordering::SeqCst);
         if let Some(pid) = *self.pid_slot.lock().unwrap() {
-            exec::kill_pid(pid);
+            exec::terminate_group(pid);
         }
         let _ = self.cmd_tx.send(UiCommand::Abort);
     }

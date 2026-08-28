@@ -22,7 +22,8 @@ const TICK: Duration = Duration::from_millis(50);
 pub fn run(job: Job, cfg: Config) -> Result<i32> {
     let pane_id = std::env::var("HERDR_PANE_ID").ok();
     let lock = job.lock_path(&job::state_dir());
-    let _ = Lock::write(&lock, pane_id.clone());
+    // Held for the lifetime of this pane; released by the kernel if we die.
+    let _lock = Lock::acquire(&lock, pane_id.clone()).ok().flatten();
     let herdr = Herdr::from_env();
 
     let worker = Worker::spawn(job, cfg.clone());
@@ -67,7 +68,6 @@ pub fn run(job: Job, cfg: Config) -> Result<i32> {
 
     ratatui::restore();
     worker.abort();
-    Lock::remove(&lock);
     result?;
     Ok(app.exit_code())
 }

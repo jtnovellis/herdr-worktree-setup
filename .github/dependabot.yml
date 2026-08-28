@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+  # Keeps the SHA pins in the workflows current — the tag lives in a comment
+  # beside each pin, so these updates stay reviewable.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

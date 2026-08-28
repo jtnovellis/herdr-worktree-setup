@@ -123,11 +123,31 @@ fn read_with_timeout(mut child: std::process::Child, timeout: Duration) -> Optio
     reader.join().ok()
 }
 
+/// Parse `env -0` output: one `KEY=VALUE` record per NUL. Unambiguous, so a
+/// value containing a newline cannot forge a later assignment (notably `PATH`).
+fn parse_nul(block: &str) -> Option<BTreeMap<OsString, OsString>> {
+    let vars: BTreeMap<OsString, OsString> = block
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            // The marker `printf` leaves a newline before the first record; a
+            // key never contains one, so stripping it is unambiguous.
+            let (k, v) = record.trim_start_matches('\n').split_once('=')?;
+            (!k.is_empty()).then(|| (OsString::from(k), OsString::from(v)))
+        })
+        .collect();
+    (!vars.is_empty()).then_some(vars)
+}
+
 fn parse_block(bytes: &[u8]) -> Option<BTreeMap<OsString, OsString>> {
     let text = String::from_utf8_lossy(bytes);
     let start = text.find(BEGIN)? + BEGIN.len();
     let end = text[start..].find(END)? + start;
     let block = &text[start..end];
+    if block.contains('\0') {
+        return parse_nul(block);
+    }
+    // Fallback for an `env` without `-0`; line-based and therefore ambiguous.
     let mut vars: BTreeMap<OsString, OsString> = BTreeMap::new();
     let mut last_key: Option<String> = None;
     for line in block.lines() {
@@ -161,7 +181,12 @@ fn parse_block(bytes: &[u8]) -> Option<BTreeMap<OsString, OsString>> {
 }
 
 fn probe(shell: &Path, flags: &[&str], timeout: Duration) -> Option<BTreeMap<OsString, OsString>> {
-    let script = format!("printf '\\n{BEGIN}\\n'; command env; printf '{END}\\n'");
+    // `env -0` first: NUL-delimited output cannot be mis-split. An `env` that
+    // does not support it exits non-zero before printing, so the plain `env`
+    // fallback still produces a parseable block.
+    let script = format!(
+        "printf '\\n{BEGIN}\\n'; command env -0 2>/dev/null || command env; printf '\\n{END}\\n'"
+    );
     let child = Command::new(shell)
         .args(flags)
         .arg(&script)
@@ -279,6 +304,38 @@ impl ResolvedEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_records_cannot_forge_an_assignment() {
+        let raw = format!("junk\n{BEGIN}\nA=1\0EVIL=x\nPATH=/attacker\0PATH=/real\0{END}\n");
+        let vars = parse_block(raw.as_bytes()).unwrap();
+        assert_eq!(vars.get(OsStr::new("A")).unwrap(), "1");
+        assert_eq!(
+            vars.get(OsStr::new("EVIL")).unwrap(),
+            "x\nPATH=/attacker",
+            "a newline inside a value stays inside it"
+        );
+        assert_eq!(vars.get(OsStr::new("PATH")).unwrap(), "/real");
+    }
+
+    #[test]
+    fn a_real_shell_probe_uses_nul_records() {
+        let env = ResolvedEnv::resolve_with(Path::new("/bin/sh"), Duration::from_secs(5));
+        assert_ne!(env.origin, EnvOrigin::Current);
+        // Prove the NUL path is the one taken on this platform.
+        let script = format!(
+            "printf '\\n{BEGIN}\\n'; command env -0 2>/dev/null || command env; printf '\\n{END}\\n'"
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            out.stdout.contains(&0u8),
+            "`env -0` unavailable here; the line-based fallback is in use"
+        );
+    }
 
     #[test]
     fn parses_marked_block_with_multiline_values() {

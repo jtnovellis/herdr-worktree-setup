@@ -41,9 +41,15 @@ is optional.
 herdr plugin install jtnovellis/herdr-worktree-setup
 ```
 
-The build step downloads a prebuilt, SHA-256-verified binary for macOS
-(arm64, x86_64) or Linux (x86_64, aarch64). If there is none for your platform
-it builds from source with `cargo` (Rust 1.85+).
+The build step downloads a prebuilt binary for macOS (arm64, x86_64) or Linux
+(x86_64, aarch64) over https and verifies its SHA-256; a mismatch aborts the
+install. If there is no prebuilt binary for your platform it builds from source
+with `cargo` (Rust 1.85+). Release binaries carry Sigstore build provenance:
+
+```sh
+gh attestation verify --repo jtnovellis/herdr-worktree-setup \
+  herdr-worktree-setup-aarch64-apple-darwin.tar.gz
+```
 
 Requires herdr **0.8.0+** (the `worktree.created` event is emitted for
 UI-created worktrees from 0.8).
@@ -115,10 +121,14 @@ it to `symlink = [...]`.
 
 ## Configuration (optional)
 
-Three layers, later ones win: **user** config, the repo's committed
-`.herdr-worktree.toml` (read from the worktree, so it belongs to the branch),
-and an ignored `.herdr-worktree.local.toml` (read from the main checkout and
-carried over). Lists extend the defaults; `exclude` always wins.
+Three layers, later ones win: your **user** config, the repo's committed
+`.herdr-worktree.toml`, and the gitignored `.herdr-worktree.local.toml`. Lists
+extend the defaults; `exclude` always wins.
+
+Both repo layers are read from your **source checkout**, never from the
+worktree being set up — the branch you are about to review does not get to
+reconfigure the tool setting it up. A config file that exists only on the
+branch is ignored, and the pane says so. See [SECURITY.md](SECURITY.md).
 
 ```sh
 $EDITOR "$(herdr plugin config-dir worktree-setup)/config.toml"
@@ -139,6 +149,7 @@ direnv_allow = true
 use_mise = true            # wrap installs/steps in `mise exec --` when the repo has mise config
 use_direnv = true          # wrap installs/steps in `direnv exec` when the repo has .envrc
 trust_repo_steps = true    # run [[steps]] from repo config (same trust as a postinstall script)
+step_timeout_secs = 1800   # kill a step (and everything it forked) after this long; 0 = no limit
 
 copy    = [".secrets/"]        # extend the defaults
 clone   = [".pio/"]
@@ -149,8 +160,14 @@ exclude = [".env.prod"]
 NODE_OPTIONS = "--max-old-space-size=4096"
 ```
 
-Repo-level `.herdr-worktree.toml` accepts the same keys except `focus`,
-`placement`, `direction`, `color`, `trust_repo_steps`, plus custom steps:
+A repo-level `.herdr-worktree.toml` may only ever **restrict** the run. It can
+turn `install`, `mise_trust`, `direnv_allow`, `use_mise` and `use_direnv` off,
+and lower `copy_size_cap_mb`, `total_size_cap_mb` and `step_timeout_secs`. It
+cannot turn them on, raise a cap, set `focus`, `placement`, `direction`,
+`mode`, `color`, `auto_close_secs` or `trust_repo_steps`, add to `symlink`, or
+set an environment variable that decides which program runs (`PATH`, `LD_*`,
+`DYLD_*`, `NODE_OPTIONS`, …). Refusals are reported in the pane. It may add
+custom steps:
 
 ```toml
 [[steps]]
@@ -199,11 +216,36 @@ herdr-worktree-setup plan --source <main> --target <worktree> [--apply] [--tui]
 
 ## Trust
 
-A plugin is ordinary code running as you. This one only ever *reads* the main
-checkout and *writes* into the new worktree, but repo-defined `[[steps]]` run
-arbitrary commands on worktree creation — the same trust level as a
-`postinstall` script. Set `trust_repo_steps = false` in your user config to
-ignore them; `worktree-setup.plan` shows every command before anything runs.
+A plugin is ordinary code running as you, and this one fires automatically on
+every worktree creation — so `git worktree add`, which executes nothing on its
+own, now runs code. [SECURITY.md](SECURITY.md) is the full trust model; the
+short version:
+
+- **Configuration comes from your checkout, never from the branch**, and a repo
+  config may only ever restrict what runs.
+- **Reads** are confined to the source checkout, **writes** to the worktree:
+  every destination is resolved component by component and refused if any
+  component is a symlink, so a committed symlink cannot redirect a copy — your
+  `.env` included — somewhere else. Nothing existing is overwritten.
+- **What still runs branch code by design:** the dependency install (the
+  branch's `postinstall` scripts) and repo `[[steps]]`. `mise trust` and
+  `direnv allow` grant *persistent* execution rights to a `mise.toml` /
+  `.envrc`. Each has its own switch.
+- **Your secrets move into a tree the branch controls.** Whether the copied
+  `.env` stays gitignored there is up to the branch's `.gitignore`; the plugin
+  warns loudly about every copied file the branch does not ignore, so a routine
+  `git add -A` cannot quietly commit your credentials.
+
+To review an untrusted branch with nothing from it executed:
+
+```toml
+install = false
+trust_repo_steps = false
+mise_trust = false
+direnv_allow = false
+```
+
+`worktree-setup.plan` shows every command and every file before anything runs.
 
 ## License
 

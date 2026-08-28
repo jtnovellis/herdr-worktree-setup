@@ -12,14 +12,17 @@
 
 id = "worktree-setup"
 name = "Worktree Setup"
-version = "0.1.0"
+version = "0.1.1"
 # worktree.created is emitted for UI- and API-created worktrees from herdr 0.8.
 min_herdr_version = "0.8.0"
 description = "Make a new git worktree immediately usable: copy .env & dev state, clone dependency caches (APFS/reflink), mise trust, direnv allow, install deps — with a live TUI."
 platforms = ["macos", "linux"]
 
 # Runs on `herdr plugin install`: downloads the prebuilt release binary for this
-# platform (SHA-256 verified) and falls back to `cargo build --release`.
+# platform over https and checks it against the SHA256SUMS published with the
+# release — that detects corruption, not tampering by whoever can publish it;
+# see SECURITY.md. A mismatch aborts. No prebuilt binary for this platform means
+# `cargo build --release --locked` instead.
 [[build]]
 command = ["/bin/sh", "scripts/fetch-or-build.sh"]
 

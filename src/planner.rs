@@ -21,7 +21,7 @@ impl PlanAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemState {
     Pending,
     /// Already present in the target — never overwritten.
@@ -29,6 +29,9 @@ pub enum ItemState {
     Excluded,
     Unmatched,
     NestedRepo,
+    /// The destination could not be reached safely (a symlinked component in
+    /// the worktree). Reported, never written.
+    Blocked(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,10 +66,13 @@ fn to_plan_action(action: Action) -> Option<PlanAction> {
 }
 
 fn state_for(target: &Path, rel: &str) -> ItemState {
-    if std::fs::symlink_metadata(target.join(rel)).is_ok() {
-        ItemState::Exists
-    } else {
-        ItemState::Pending
+    // Resolve the destination the same way the copier will, so an item whose
+    // path crosses a symlink is visible in the plan instead of surfacing only
+    // when it is applied.
+    match crate::fsops::contained_dst(target, rel) {
+        Err(reason) => ItemState::Blocked(reason),
+        Ok(dst) if std::fs::symlink_metadata(&dst).is_ok() => ItemState::Exists,
+        Ok(_) => ItemState::Pending,
     }
 }
 
@@ -109,6 +115,12 @@ impl CopyPlan {
                                 let name = entry.file_name().to_string_lossy().into_owned();
                                 let rel = format!("{}/{}", cand.rel, name);
                                 let Ok(ft) = entry.file_type() else { continue };
+                                // Unlike git's enumeration, `read_dir` reports
+                                // FIFOs, sockets and devices; copying one would
+                                // block forever.
+                                if !(ft.is_file() || ft.is_dir() || ft.is_symlink()) {
+                                    continue;
+                                }
                                 let is_symlink = ft.is_symlink();
                                 let is_dir = ft.is_dir();
                                 if let Some(action) =
@@ -168,6 +180,17 @@ impl CopyPlan {
         self.items_in(group)
             .into_iter()
             .filter(|i| i.state == ItemState::Pending)
+            .collect()
+    }
+
+    /// Items whose destination could not be reached safely.
+    pub fn blocked_in(&self, group: Group) -> Vec<(&PlanItem, &str)> {
+        self.items_in(group)
+            .into_iter()
+            .filter_map(|i| match &i.state {
+                ItemState::Blocked(reason) => Some((i, reason.as_str())),
+                _ => None,
+            })
             .collect()
     }
 }

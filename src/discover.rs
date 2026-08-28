@@ -18,7 +18,13 @@ pub struct Candidate {
 
 fn run_git(git: &Path, source: &Path, args: &[&str], pathspecs: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = Command::new(git);
-    cmd.arg("-C").arg(source).args(args);
+    // `--literal-pathspecs` stops a file whose *name* begins with `:(...)` from
+    // being parsed as pathspec magic — which would otherwise change, or abort,
+    // the very query that decides what may be copied.
+    cmd.arg("-C")
+        .arg(source)
+        .arg("--literal-pathspecs")
+        .args(args);
     if !pathspecs.is_empty() {
         cmd.arg("--").args(pathspecs);
     }
@@ -79,7 +85,10 @@ pub fn list_ignored(git: &Path, source: &Path) -> Result<Vec<Candidate>> {
         };
         let is_symlink = meta.file_type().is_symlink();
         let is_dir = is_dir_entry || (!is_symlink && meta.is_dir());
-        let nested_repo = is_dir && !is_symlink && abs.join(".git").exists();
+        // `exists()` follows symlinks and reports false for a dangling one, so
+        // a `.git -> /nonexistent` link would slip past. Presence is what counts.
+        let nested_repo =
+            is_dir && !is_symlink && std::fs::symlink_metadata(abs.join(".git")).is_ok();
         candidates.push(Candidate {
             rel,
             is_dir,

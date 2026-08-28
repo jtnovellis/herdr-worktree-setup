@@ -3,6 +3,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -234,20 +236,24 @@ impl Job {
     }
 
     /// Stable file-name key for job/lock files.
+    ///
+    /// The readable part is lossy (`w1:p1` and `w1/p1` both reduce to `w1p1`),
+    /// so a hash of the original disambiguates. Two workspaces sharing a job
+    /// file would give one worktree the other's source and target paths.
     pub fn key(&self) -> String {
+        use std::hash::{Hash, Hasher};
         let raw = self
             .workspace_id
             .clone()
             .unwrap_or_else(|| self.target.display().to_string());
-        raw.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut hasher);
+        let slug: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(24)
+            .collect();
+        format!("{slug}-{:016x}", hasher.finish())
     }
 
     pub fn write(&self, state_dir: &Path) -> Result<PathBuf> {
@@ -328,42 +334,68 @@ pub struct Lock {
     pub pane_id: Option<String>,
 }
 
-pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
+/// Try to take an exclusive advisory lock on an open file, without blocking.
+///
+/// This is what makes "is a setup pane already running?" reliable: the kernel
+/// releases the lock when the holder exits, however it exits, so a leftover
+/// file can never masquerade as a live process the way a recorded pid can once
+/// the number is recycled.
+fn try_flock(file: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// A held lock. Dropping it — or exiting — releases it.
+pub struct LockGuard {
+    _file: File,
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
-    // kill(pid, 0) probes existence; EPERM still means "exists".
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 impl Lock {
-    /// The lock at `path` if it names a process that is still running.
+    /// The lock at `path`, if a live process holds it.
     pub fn read_live(path: &Path) -> Option<Lock> {
-        let raw = std::fs::read_to_string(path).ok()?;
-        let lock: Lock = serde_json::from_str(&raw).ok()?;
-        if pid_alive(lock.pid) {
-            Some(lock)
-        } else {
+        let file = File::open(path).ok()?;
+        if try_flock(&file) {
+            // Nobody was holding it: the file is stale.
+            drop(file);
             let _ = std::fs::remove_file(path);
-            None
+            return None;
         }
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&raw).ok()
     }
 
-    pub fn write(path: &Path, pane_id: Option<String>) -> Result<()> {
+    /// Take the lock for this process; `None` means another process holds it.
+    pub fn acquire(path: &Path, pane_id: Option<String>) -> Result<Option<LockGuard>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        if !try_flock(&file) {
+            return Ok(None);
         }
         let lock = Lock {
             pid: std::process::id(),
             pane_id,
         };
-        std::fs::write(path, serde_json::to_string(&lock)?)?;
-        Ok(())
-    }
-
-    pub fn remove(path: &Path) {
-        let _ = std::fs::remove_file(path);
+        let body = serde_json::to_string(&lock)?;
+        file.set_len(0)?;
+        (&file).write_all(body.as_bytes())?;
+        Ok(Some(LockGuard {
+            _file: file,
+            path: path.to_path_buf(),
+        }))
     }
 }
 
@@ -429,7 +461,32 @@ mod tests {
         };
         assert_eq!(job.source, PathBuf::from("/r"));
         assert_eq!(job.target, PathBuf::from("/w"));
-        assert_eq!(job.key(), "w9");
+        assert!(job.key().starts_with("w9-"), "{}", job.key());
+    }
+
+    /// Workspace ids differing only in punctuation must not share a job file.
+    #[test]
+    fn keys_do_not_collide_across_workspaces() {
+        let mk = |ws: &str| Job {
+            source: "/a".into(),
+            target: "/b".into(),
+            branch: None,
+            workspace_id: Some(ws.into()),
+            repo_name: "a".into(),
+            dry_run: false,
+            workspace_focused: true,
+            job_file: None,
+        };
+        let keys: Vec<String> = ["w1:p1", "w1/p1", "w1.p1", "w1_p1", "w1-p1"]
+            .iter()
+            .map(|ws| mk(ws).key())
+            .collect();
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "collision in {keys:?}");
+        for key in &keys {
+            assert!(!key.contains('/') && !key.contains("..") && !key.contains(':'));
+        }
+        assert_eq!(mk("w1:p1").key(), mk("w1:p1").key(), "stable");
     }
 
     #[test]
@@ -446,7 +503,7 @@ mod tests {
             job_file: None,
         };
         let path = job.write(dir.path()).unwrap();
-        assert!(path.ends_with("jobs/w1_x.json"));
+        assert!(path.starts_with(dir.path().join("jobs")));
         let read_back = Job::read(&path).unwrap();
         assert_eq!(read_back.job_file.as_deref(), Some(path.as_path()));
         assert_eq!(
@@ -461,11 +518,18 @@ mod tests {
             job
         );
         let lock = job.lock_path(dir.path());
-        Lock::write(&lock, Some("w1:p1".into())).unwrap();
-        let live = Lock::read_live(&lock).expect("own pid is alive");
+        let guard = Lock::acquire(&lock, Some("w1:p1".into()))
+            .unwrap()
+            .expect("first acquire succeeds");
+        let live = Lock::read_live(&lock).expect("we hold it");
         assert_eq!(live.pid, std::process::id());
-        std::fs::write(&lock, r#"{"pid":999999999,"pane_id":null}"#).unwrap();
+        assert_eq!(live.pane_id.as_deref(), Some("w1:p1"));
+        drop(guard);
+        assert!(!lock.exists(), "releasing removes the lock file");
+        // A file left behind by a process that died is not taken for a live one,
+        // however its pid number has since been reused.
+        std::fs::write(&lock, r#"{"pid":1,"pane_id":"w9:p9"}"#).unwrap();
         assert!(Lock::read_live(&lock).is_none());
-        assert!(!lock.exists(), "dead lock is removed");
+        assert!(!lock.exists(), "stale lock is cleaned up");
     }
 }
