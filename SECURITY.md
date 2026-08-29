@@ -8,6 +8,7 @@ patched.
 | Version | Supported |
 |---------|-----------|
 | latest  | ✅ |
+| 0.1.2   | ❌ superseded — upgrade |
 | 0.1.1   | ❌ superseded — upgrade |
 | 0.1.0   | ❌ **withdrawn: contains a command injection.** Its binaries have been deleted from the release; the [tag](https://github.com/jtnovellis/herdr-worktree-setup/releases/tag/v0.1.0) is kept, with the removed assets' digests, so the withdrawal is auditable. See [CHANGELOG](CHANGELOG.md). |
 

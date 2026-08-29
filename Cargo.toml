@@ -1,6 +1,6 @@
 [package]
 name = "herdr-worktree-setup"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.88"
 description = "herdr plugin: make a new git worktree immediately usable (copy .env & dev state, clone dependency caches, mise trust, direnv allow, install deps) with a live TUI"

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.3
+
+No functional change: `src/` is untouched since 0.1.2, so the binary behaves
+identically. This release republishes it from the current, better-verified
+pipeline and corrects a claim 0.1.2 made about its own CI.
+
+### Fixed
+
+- **The MSRV job never tested the MSRV.** 0.1.2 said CI enforced `rust-version`
+  "on the 1.88 toolchain". It did not. `dtolnay/rust-toolchain` selects a
+  toolchain with `rustup default`, which a `rust-toolchain.toml` outranks — so
+  the job installed 1.88, made it the default, and then compiled with the
+  `stable` this repo's toolchain file pins. The job now forces the compiler
+  with `RUSTUP_TOOLCHAIN` and asserts `rustc --version` really is 1.88, so the
+  failure cannot go silent again. The declared MSRV itself was correct: a
+  from-scratch `cargo check --locked --all-targets` on 1.88 over the full
+  dependency graph passes.
+
+### Changed
+
+- The release workflow round-trips every artifact and re-checks its digest
+  before publishing, and can be exercised from `workflow_dispatch` without
+  cutting a release. Actions moved to their current majors, still SHA-pinned.
+- `SECURITY.md` and the 0.1.0 entry now record the withdrawal of 0.1.0: its
+  binaries were deleted on 2026-08-28, with the removed assets' digests kept on
+  the release page so the withdrawal stays auditable.
+
 ## 0.1.2
 
 Correctness and honesty pass over the 0.1.1 security work, with render-level
